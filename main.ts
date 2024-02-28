@@ -1,38 +1,91 @@
-import { Plugin, TFile, getFrontMatterInfo } from 'obsidian';
-import { load } from 'js-yaml';
+import { Plugin, TFile, FileManager, getFrontMatterInfo } from 'obsidian';
+import { load, dump } from 'js-yaml';
 
 export default class CitationLinker extends Plugin {
 
 	async onload() {
+		
+		this.addCommand(
+			{
+				id: 'insert-references-for-all-files',
+				name: 'Insert references for all files',
+				callback: async () => {
+					// get all files from the references folder
+					const referencesFolder = this.app.vault.getFolderByPath("references");
+					for (const child of referencesFolder?.children) {
+						if (child instanceof TFile) {
+							const fileContents = await this.app.vault.read(child);
+							const frontmatter = this.getFrontMatter(fileContents);
+							const paperId = this.getPaperIdFromAnnotationTarget(frontmatter['annotation-target']);
+							if (paperId === '') return;
+							const paper = await this.fetchPaper(paperId);
+							console.log(paper)
+							const references = await this.getReferences(paper);
+							const titles = [];
+							const authors = [];
+							const years = [];
+							for (const reference of references) {
+								console.log(reference)
+								if (!reference.paperId || reference.authors.length == 0) continue;
+								titles.push(reference.title);
+								years.push(reference.year);
+								const author = await this.getFirstAuthor(reference.authors);
+								authors.push(author);
+							}
+							const citationKeys = this.createCitationKeys(authors, titles, years);
+							this.writeCitationKeysToFile(titles, citationKeys, child, fileContents);
+						}
+					}
+				}
+			}
+		)
+
+		this.addCommand({
+			id: 'insert-references',
+			name: 'Insert references',
+			callback: async () => {
+				const activeFile = await this.app.workspace.getActiveFile();
+				if (activeFile instanceof TFile) {
+					const fileContents = await this.app.vault.read(activeFile);
+					const frontmatter = this.getFrontMatter(fileContents);
+					const paperId = this.getPaperIdFromAnnotationTarget(frontmatter['annotation-target']);
+					if (paperId === '') return;
+					const paper = await this.fetchPaper(paperId);
+					const references = await this.getReferences(paper);
+					const titles = [];
+					const authors = [];
+					const years = [];
+					for (const reference of references) {
+						if (!reference.paperId || reference.authors.length == 0) continue;
+						titles.push(reference.title);
+						years.push(reference.year);
+						const author = await this.getFirstAuthor(reference.authors);
+						authors.push(author);
+					}
+					const citationKeys = this.createCitationKeys(authors, titles, years);
+					this.writeCitationKeysToFile(titles, citationKeys, activeFile, fileContents);
+				}
+			}
+		});
 		this.app.workspace.onLayoutReady(() => {
 			this.registerEvent(this.app.vault.on('create', async (file) => {
 				if (file instanceof TFile && file.parent.path === 'references') {
 					const fileContents = await this.app.vault.read(file);
 					const frontmatter = this.getFrontMatter(fileContents);
-					// if (!this.isLiteratureNote(frontmatter)) {
-					// 	return;
-					// }
-					console.log("is literature note")
 					const paperId = this.getPaperIdFromAnnotationTarget(frontmatter['annotation-target']);
-					if (paperId === '') {
-						return;
-					}
+					if (paperId === '') return;
 					const paper = await this.fetchPaper(paperId);
 					let references = await this.getReferences(paper);
 					const titles = [];
 					const authors = [];
 					const years = [];
+					// const referencePromises = references.map()
 					for (const reference of references) {
-						const referencePaperId = reference.paperId;
-						if (!referencePaperId) {
-							references = references.filter(ref => ref.paperId !== referencePaperId);
-							continue;
-						}
-						const referenceData = await this.fetchPaper(referencePaperId);
-						const firstAuthor = await this.getFirstAuthor(referenceData);
+						if (!reference.paperId || reference.authors.length == 0) continue;
 						titles.push(reference.title);
-						authors.push(firstAuthor);
-						years.push(referenceData.year);
+						years.push(reference.year);
+						const author = await this.getFirstAuthor(reference.authors);
+						authors.push(author);
 					}
 					const citationKeys = this.createCitationKeys(authors, titles, years);
 					this.writeCitationKeysToFile(titles, citationKeys, file, fileContents);
@@ -52,7 +105,6 @@ export default class CitationLinker extends Plugin {
 		if (annotationTarget.includes('arxiv')) {
 			const fileEnding = annotationTarget.split('/').pop().split('.');
 			const paperId = fileEnding[0] + '.' + fileEnding[1];
-			console.log('Found arxiv paper: ' + paperId)
 			return 'ARXIV:' + paperId;
 
 		}
@@ -66,7 +118,7 @@ export default class CitationLinker extends Plugin {
 
 	async fetchPaper(id: string) {
 		// fetch from semantic scholar API
-		const fields = 'year,authors,references'
+		const fields = 'references.title,references.year,references.authors'
 		const url = "https://api.semanticscholar.org/graph/v1/paper/" + id + "?fields=" + fields;
 		const response = await fetch(url)
 		const data = await response.json();
@@ -78,11 +130,7 @@ export default class CitationLinker extends Plugin {
 		return references;
 	}
 
-	async getFirstAuthor(data) {
-		const authors = data.authors;
-		if (authors.length === 0) {
-			return "Anonymous";
-		}
+	async getFirstAuthor(authors) {
 		const author = authors[0].name.split(' ');
 		return author[author.length - 1];
 	}
@@ -97,16 +145,18 @@ export default class CitationLinker extends Plugin {
 
 	// citationKeys is type Array<string> and file is TFile
 	async writeCitationKeysToFile(titles: Array<string>, citationKeys: Array<string>, file: TFile, fileContents: string) {
-		// append the citation key to the file
-		let newContents = fileContents;
-		newContents += '\n\n## References';
 		const bibliography = await this.getBibliography();
 		for (const key of citationKeys) {
 			if (await this.isCitationKeyInBibliography(key, bibliography)) {
-				newContents += `\n- [[@${key} | ${titles[citationKeys.indexOf(key)]}]]`;
+				const citationKey = '[[@' + key + ' | ' + titles[citationKeys.indexOf(key)] + ']]';
+				this.app.fileManager.processFrontMatter(file, frontmatter => {
+					if (!frontmatter.references) {
+						frontmatter.references = [];
+					}
+					frontmatter.references.push(citationKey);
+				})
 			}
 		}
-		this.app.vault.modify(file, newContents);
 	}
 
 	async getBibliography() {
